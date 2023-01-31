@@ -31,7 +31,7 @@ import (
 )
 
 func testIPFilterPolicy(namespace string) {
-	Specify("requests can be filtered by ip address", func() {
+	FSpecify("requests can be filtered by ip address", func() {
 		t := f.T()
 		ctx, cancel := context.WithCancel(context.Background())
 		DeferCleanup(cancel)
@@ -75,18 +75,10 @@ func testIPFilterPolicy(namespace string) {
 			if err := f.Client.Get(ctx, client.ObjectKeyFromObject(p), p); err != nil {
 				return err
 			}
-
-			p.Spec.Routes[0].IPDenyFilterPolicy = []contourv1.IPFilterPolicy{
-				{
-					Source: contourv1.IPFilterSourcePeer,
-					CIDR:   "10.8.8.8/0",
-				},
-				{
-					Source: contourv1.IPFilterSourceRemote,
-					CIDR:   "10.8.8.8/0",
-				},
+			p.Annotations = map[string]string{
+				"contour.authzed.com/0-peer.deny":   "10.8.8.8/0",
+				"contour.authzed.com/0-remote.deny": "10.8.8.8/0",
 			}
-
 			return f.Client.Update(ctx, p)
 		}))
 
@@ -103,15 +95,9 @@ func testIPFilterPolicy(namespace string) {
 			if err := f.Client.Get(ctx, client.ObjectKeyFromObject(p), p); err != nil {
 				return err
 			}
-
-			p.Spec.Routes[0].IPAllowFilterPolicy = []contourv1.IPFilterPolicy{
-				{
-					Source: contourv1.IPFilterSourceRemote,
-					CIDR:   "10.10.10.10/32",
-				},
+			p.Annotations = map[string]string{
+				"contour.authzed.com/0-remote.allow": "10.10.10.10",
 			}
-			p.Spec.Routes[0].IPDenyFilterPolicy = nil
-
 			return f.Client.Update(ctx, p)
 		}))
 

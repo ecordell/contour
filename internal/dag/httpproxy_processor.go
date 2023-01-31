@@ -34,10 +34,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/pointer"
 )
 
 // defaultMaxRequestBytes specifies default value maxRequestBytes for AuthorizationServer
 const defaultMaxRequestBytes uint32 = 1024
+
+// IPFilterAnnotationKeyPrefix is the prefix for all ip filter annotations
+const IPFilterAnnotationKeyPrefix = "contour.authzed.com/"
 
 // defaultExtensionRef populates the unset fields in ref with default values.
 func defaultExtensionRef(ref contour_api_v1.ExtensionServiceReference) contour_api_v1.ExtensionServiceReference {
@@ -680,7 +684,7 @@ func (p *HTTPProxyProcessor) computeRoutes(
 		"CONTOUR_NAMESPACE": proxy.Namespace,
 	}
 
-	for _, route := range proxy.Spec.Routes {
+	for i, route := range proxy.Spec.Routes {
 		if err := routeActionCountValid(route); err != nil {
 			validCond.AddError(contour_api_v1.ConditionTypeRouteError, "RouteActionCountNotValid", err.Error())
 			return nil
@@ -984,9 +988,100 @@ func (p *HTTPProxyProcessor) computeRoutes(
 			r.JWTProvider = defaultJWTProvider
 		}
 
-		r.IPFilterAllow, r.IPFilterRules, err = toIPFilterRules(route.IPAllowFilterPolicy, route.IPDenyFilterPolicy, validCond)
-		if err != nil {
-			return nil
+		// IP filter annotations have the form:
+		//   "contour.authzed.com/<route_index>-(peer|remote).(allow|deny)" = "<cidr>,<cidr>"
+		// Example:
+		//   "contour.authzed.com/1.peer.allow" = "10.0.0.0/24,99.1.1.1/6"
+		// Allow and Deny rules can't be mixed for the same route
+
+		var allow *bool
+		rules := make([]IPFilterRule, 0)
+		for key, value := range proxy.GetAnnotations() {
+			fmt.Println(key)
+			if !strings.HasPrefix(key, IPFilterAnnotationKeyPrefix) {
+				continue
+			}
+			routeFilterKey := strings.TrimPrefix(key, IPFilterAnnotationKeyPrefix)
+
+			// key is now of the form <routeIndex>-<source>.<type>
+			routeIndex, filter, ok := strings.Cut(routeFilterKey, "-")
+			if !ok {
+				validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidFilter",
+					"invalid filter annotation %q", key)
+				return nil
+			}
+
+			ridx, err := strconv.Atoi(routeIndex)
+			if err != nil {
+				validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidFilter",
+					"invalid filter annotation, bad index %q (%q)", routeIndex, key)
+				return nil
+			}
+
+			if ridx != i {
+				// rule doesn't apply to this route
+				continue
+			}
+
+			// filter is now of the form <source>.<type>
+			source, filterType, ok := strings.Cut(filter, ".")
+			if !ok {
+				validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidFilter",
+					"invalid filter annotation %q", key)
+				return nil
+			}
+
+			if filterType != "allow" && filterType != "deny" {
+				validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidFilterType",
+					"expected allow or deny, got: %q (%q)", filterType, key)
+				return nil
+			}
+
+			if allow == nil {
+				allow = pointer.Bool(filterType == "allow")
+			} else {
+				if filterType == "allow" && !*allow || filterType == "deny" && *allow {
+					validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "MixesAllowAndDeny",
+						"cannot mix both allow and deny rules for route %d", i)
+					return nil
+				}
+			}
+
+			if source != "remote" && source != "peer" {
+				validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidSourceType",
+					"expected remote or peer, got: %q (%q)", source, key)
+				return nil
+			}
+
+			cidrRanges := strings.Split(value, ",")
+
+			for _, cidr := range cidrRanges {
+				// convert bare IPs to CIDRs
+				if !strings.Contains(cidr, "/") {
+					if strings.Contains(cidr, ":") {
+						cidr += "/128"
+					} else {
+						cidr += "/32"
+					}
+				}
+
+				_, ipnet, err := net.ParseCIDR(cidr)
+				if err != nil {
+					validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidCIDR",
+						"%s failed to parse: %s", cidr, err)
+					return nil
+				}
+				rules = append(rules, IPFilterRule{
+					Remote: source == "remote",
+					CIDR:   *ipnet,
+				})
+			}
+
+		}
+		if allow != nil {
+			r.IPFilterAllow = *allow
+			r.IPFilterRules = rules
+			fmt.Println("allow", *allow, rules)
 		}
 
 		routes = append(routes, r)
@@ -995,47 +1090,6 @@ func (p *HTTPProxyProcessor) computeRoutes(
 	routes = expandPrefixMatches(routes)
 
 	return routes
-}
-
-// toIPFilterRules converts ip filter settings from the api into the
-// dag representation
-func toIPFilterRules(allowPolicy, denyPolicy []contour_api_v1.IPFilterPolicy, validCond *contour_api_v1.DetailedCondition) (allow bool, filters []IPFilterRule, err error) {
-	var ipPolicies []contour_api_v1.IPFilterPolicy
-	switch {
-	case len(allowPolicy) > 0 && len(denyPolicy) > 0:
-		validCond.AddError(contour_api_v1.ConditionTypeIPFilterError, "IncompatibleIPAddressFilters",
-			"route cannot specify both `ipAllowPolicy` and `ipDenyPolicy`")
-		err = fmt.Errorf("invalid ip filter")
-		return
-	case len(allowPolicy) > 0:
-		allow = true
-		ipPolicies = allowPolicy
-	case len(denyPolicy) > 0:
-		allow = false
-		ipPolicies = denyPolicy
-	}
-	if ipPolicies == nil {
-		return
-	}
-	filters = make([]IPFilterRule, 0, len(ipPolicies))
-	for _, p := range ipPolicies {
-		var cidr *net.IPNet
-		_, cidr, err = net.ParseCIDR(p.CIDR)
-		if err != nil {
-			validCond.AddErrorf(contour_api_v1.ConditionTypeIPFilterError, "InvalidCIDR",
-				"%s failed to parse: %s", p.CIDR, err)
-			continue
-		}
-		filters = append(filters, IPFilterRule{
-			Remote: p.Source == contour_api_v1.IPFilterSourceRemote,
-			CIDR:   *cidr,
-		})
-	}
-	if err != nil {
-		allow = false
-		filters = nil
-	}
-	return
 }
 
 // processHTTPProxyTCPProxy processes the spec.tcpproxy stanza in a HTTPProxy document
